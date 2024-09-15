@@ -1,0 +1,739 @@
+###################################################################
+#                                                                 #
+#                                                                 #
+#             [ Minimal Private OCI Image Registry ]              #
+#                          - Kim Hwiwon <kim.hwiwon@outlook.com>  #
+#                                                                 #
+#                                                                 #
+# - Getting Started                                               #
+#                                                                 #
+#   $ podman kube play mreg.yml    # podman                       #
+#   $ kubectl apply -f mreg.yml    # k8s                          #
+#                                                                 #
+#                                                                 #
+# - Manage Users (Run commands inside a *AUTH* container):        #
+#                                                                 #
+#   $ manage-user ls                  # list users                #
+#   $ manage-user add <user-name>     # add a user                #
+#   $ manage-user toggle <user-name>  # toggle a user as admin    #
+#   $ manage-user rm <user-name>      # delete a user             #
+#                                                                 #
+#   - podman                                                      #
+#     $ podman exec -it mreg-pod-auth manage-user                 #
+#                                                                 #
+#   - k8s                                                         #
+#     $ kubectl exec -it deploy/mreg -n mreg -- manage-user       #
+#                                                                 #
+#                                                                 #
+# - Manage TLS (Run commands inside a *AUTH* container):          #
+#                                                                 #
+#   $ manage-tls print                # print current tls info    #
+#   $ manage-tls cert                 # write/delete .crt file    #
+#   $ manage-tls key                  # write/delete .key file    #
+#                                                                 #
+#   - podman                                                      #
+#     $ podman exec -it mreg-pod-auth manage-tls                  #
+#                                                                 #
+#   - k8s                                                         #
+#     $ kubectl exec -it deploy/mreg -n mreg -- manage-tls        #
+#                                                                 #
+#                                                                 #
+# - Untag Image Manifest Remotely                                 #
+#                                                                 #
+#   1) Get a digest of target image tag manifest:                 #
+#     $ curl -u <admin_name> \                                    #
+#      -H "Accept: application/vnd.oci.image.manifest.v1+json" \  #
+#      -I <ip>:<port>/v2/<img_name>/manifests/<img_tag> \         #
+#      | grep "^Docker-Content-Digest"                            #
+#                                                                 #
+#   2) Delete manifest (untag)                                    #
+#     Warning: This DELETE request will untag & delete            #
+#              ALL TAGS REFERENCING THE SAME TARGET DIGEST!       #
+#                                                                 #
+#     $ curl -u <admin_name> -X DELETE \                          #
+#      <ip>:<port>/v2/<img_name>/manifests/<digest_above>         #
+#                                                                 #
+#                                                                 #
+# - Automatic Image Garbage Collection                            #
+#   (delete unused blob untagged above)                           #
+#                                                                 #
+#     Restart the image periodically (every 5 AM, etc.),          #
+#     then unused files are removed on image startup!             #
+#                                                                 #
+#                                                                 #
+###################################################################
+
+
+
+# namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/name: mreg-ns
+    hwiwon.kim/mreg: ns
+  name: mreg
+
+---
+
+
+
+# service
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/name: mreg-svc
+    hwiwon.kim/mreg: svc
+  name: mreg-svc
+  namespace: mreg
+spec:
+  selector:
+    hwiwon.kim/mreg: pod
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: auth
+      name: http-port
+    - protocol: TCP
+      port: 443
+      targetPort: auth
+      name: https-port
+
+---
+
+
+
+# pvc - reg
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app.kubernetes.io/name: mreg-pvc
+    hwiwon.kim/mreg: pvc
+  name: mreg-pvc
+  namespace: mreg
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+
+
+
+# pvc - auth
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app.kubernetes.io/name: mreg-pvc-auth
+    hwiwon.kim/mreg: pvc-auth
+  name: mreg-pvc-auth
+  namespace: mreg
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Mi
+
+---
+
+
+
+# deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/name: mreg
+    hwiwon.kim/mreg: dep
+  name: mreg
+  namespace: mreg
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      hwiwon.kim/mreg: pod
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mreg-pod
+        hwiwon.kim/mreg: pod
+      annotations:
+        kubectl.kubernetes.io/default-container: "auth"
+      namespace: mreg
+    spec:
+      hostname: minimal-oci-registry
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsUser: 30000
+        runAsGroup: 30000
+        fsGroup: 30000
+        fsGroupChangePolicy: "OnRootMismatch"
+      volumes:
+        - name: mreg-pv
+          persistentVolumeClaim:
+            claimName: mreg-pvc
+        - name: mreg-conf-sh
+          configMap:
+            name: mreg-conf-sh
+            defaultMode: 0555
+
+        - name: mreg-pv-auth
+          persistentVolumeClaim:
+            claimName: mreg-pvc-auth
+        - name: mreg-conf-auth-httpd
+          configMap:
+            name: mreg-conf-auth-httpd
+            defaultMode: 0444
+        - name: mreg-conf-auth-sh
+          configMap:
+            name: mreg-conf-auth-sh
+            defaultMode: 0555
+        - name: mreg-tmpvol-auth
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+
+      containers:
+
+        - image: docker.io/registry:2.8
+          livenessProbe:
+            exec:
+              command:
+                - healthcheck
+            failureThreshold: 2
+            initialDelaySeconds: 5
+            periodSeconds: 60
+            timeoutSeconds: 5
+          name: mreg
+          securityContext:
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: mreg-pv
+              mountPath: /var/lib/registry
+            - name: mreg-conf-sh
+              mountPath: /var/lib/registry/bin
+          
+          args:
+            - entrypoint-wrapper
+          env:
+            - name: PATH
+              value: "/var/lib/registry/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "true"
+
+        - image: docker.io/httpd:2.4-alpine
+          livenessProbe:
+            exec:
+              command:
+                - healthcheck
+            failureThreshold: 2
+            initialDelaySeconds: 5
+            periodSeconds: 60
+            timeoutSeconds: 5
+          name: auth
+          securityContext:
+            readOnlyRootFilesystem: true
+          ports:
+            - containerPort: 55000
+              hostPort: 5000
+              protocol: TCP
+              name: auth
+          volumeMounts:
+            - name: mreg-conf-auth-httpd
+              mountPath: /usr/local/apache2/conf
+              readOnly: true
+            - name: mreg-conf-auth-sh
+              mountPath: /usr/local/apache2/conf/bin
+              readOnly: true
+            - name: mreg-pv-auth
+              mountPath: /usr/local/apache2/conf/auth
+            - name: mreg-tmpvol-auth
+              mountPath: /tmp
+          args:
+            - entrypoint-wrapper
+          env:
+            - name: PATH
+              value: "/usr/local/apache2/conf/bin:/usr/local/apache2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+---
+
+
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/name: mreg-conf-sh
+    hwiwon.kim/mreg: conf-sh
+  name: mreg-conf-sh
+  namespace: mreg
+data:
+
+  entrypoint-wrapper: |
+    #!/bin/sh
+    mkdir -p /var/lib/registry/docker/registry/v2/repositories /var/lib/registry/docker/registry/v2/blobs 2>/dev/null
+    printf "\n[%s] Garbage Collecting...\n%s\n\n" "$(date)" "$(/entrypoint.sh garbage-collect /etc/docker/registry/config.yml -m 2>&1)" >&2
+    exec /entrypoint.sh /etc/docker/registry/config.yml
+
+  healthcheck: |
+    #!/bin/sh
+    exec /usr/bin/wget --spider http://localhost:5000/v2/
+
+---
+
+
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/name: mreg-conf-auth-sh
+    hwiwon.kim/mreg: conf-auth-sh
+  name: mreg-conf-auth-sh
+  namespace: mreg
+data:
+
+  entrypoint-wrapper: |
+    #!/bin/sh
+    cd /usr/local/apache2/conf/ || exit 1
+
+    touch ./auth/httpd.htpasswd ./auth/httpd.group
+    chmod 600 ./auth/httpd.htpasswd ./auth/httpd.group
+
+    exec httpd-foreground
+
+
+  healthcheck: |
+    #!/bin/sh
+    unset IS_TLS
+    [ -f /usr/local/apache2/conf/auth/tls.crt ] && [ -f /usr/local/apache2/conf/auth/tls.key ] && IS_TLS=1
+    wget -S --no-check-certificate "${IS_TLS:+https://}localhost:55000/v2/" 2>&1 \
+      | grep -q "HTTP/1.1 401 Unauthorized"
+
+
+  manage-user: |
+    #!/bin/sh
+
+    #
+    # user management script for http auth
+    #  - Kim Hwiwon <kim.hwiwon@outlook.com>
+    #
+    # usage: manage-user <VERB>
+    #                  
+    #                    ls
+    #                    add <user-name>
+    #                    toggle <user-name>
+    #                    rm <user-name>
+    #
+
+    # envs
+    PASSWD_FILE="/usr/local/apache2/conf/auth/httpd.htpasswd"
+    GROUP_FILE="/usr/local/apache2/conf/auth/httpd.group"
+
+
+    # Local Sig: MAIN
+    main() {
+
+      __MAIN_mode="${1:+$(to_lower "${1}")}"
+      shift
+
+      case "${__MAIN_mode}" in
+
+        "ls" | "list" | "l" )
+          mode_ls "${@}"
+          ;;
+
+        "add" | "a" | "new" | "n" )
+          mode_add "${@}"
+          ;;
+
+        "toggle" | "t" )
+          mode_toggle "${@}"
+          ;;
+
+        "del" | "d" | "rm" | "r" )
+          mode_del "${@}"
+          ;;
+
+
+        *)
+          print_help
+          return 1
+          ;;
+      esac
+
+    }
+
+
+
+    ### MODE ###
+
+    # Local Sig: LS
+    mode_ls() {
+
+      init_files || return "${?}"
+
+      __LS_all_users="$(cut -d: -f1 "${PASSWD_FILE}" | tr '\n' ' ')"
+      __LS_admins="$(grep -m1 "^admin: " "${GROUP_FILE}" | cut -d: -f2- | tr -d '\n')"
+
+      printf "\n[ ALL USERS ]\n\t %s\n\n[ ADMINS ]\n\t%s\n\n" "${__LS_all_users}" "${__LS_admins}"
+
+    }
+
+
+    # Local Sig: NEW
+    mode_add() {
+
+      __NEW_name="${1:?No username}"
+
+      init_files || return "${?}"
+
+      if htpasswd -B -C 13 "${PASSWD_FILE}" "${__NEW_name}"
+      then
+        printf " > Created or updated the user: '%s'\n" "${__NEW_name}" >&2
+      else
+        printf " * Failed to create or update the user: '%s' *\n" "${__NEW_name}" >&2
+        return 1
+      fi
+
+      true
+    }
+
+
+    # Local Sig: ADM
+    mode_toggle() {
+
+      __ADM_name="${1:?No username}"
+
+      init_files || return "${?}"
+
+      __ADM_admins="$(grep -m1 "^admin: " "${GROUP_FILE}" | cut -d: -f2- | tr -d '\n')"
+
+
+      # user existence check
+      if ! user_exists "${__ADM_name}"
+      then
+        printf " * No user: '%s' * \n" "${__ADM_name}" >&2
+        return 1
+      fi
+
+
+      # user group check
+      if printf "%s" "${__ADM_admins}" | grep -qF " ${__ADM_name} "
+      then
+        # if user is admin
+        if printf "admin: %s" "$(printf "%s" "${__ADM_admins}" | sed 's/ '"${__ADM_name}"' / /g')" > "${GROUP_FILE}"
+        then
+          printf " > Switched to non-admin: '%s'\n" "${__ADM_name}" >&2
+        else
+          printf " * Failed to switch user to non-admin: '%s' *\n" "${__ADM_name}" >&2
+          return 1
+        fi
+
+      else
+        # if user is not admin
+        if printf "admin: %s %s " "${__ADM_admins}" "${__ADM_name}" | tr -s ' ' > "${GROUP_FILE}"
+        then
+          printf " > Switched to admin: '%s'\n" "${__ADM_name}" >&2
+        else
+          printf " * Failed to switch the user to admin: '%s' *\n" "${__ADM_name}" >&2
+          return 1
+        fi
+      fi
+
+      true
+    }
+
+
+    # Local Sig: DEL
+    mode_del() {
+
+      __DEL_name="${1:?No username}"
+
+      init_files || return "${?}"
+
+      # user existence check
+      if ! user_exists "${__DEL_name}"
+      then
+        printf " * No user: '%s' * \n" "${__DEL_name}" >&2
+        return 1
+      fi
+
+      # remove user
+      if htpasswd -D "${PASSWD_FILE}" "${__DEL_name}"
+      then
+        printf " > Deleted the user: '%s'\n" "${__DEL_name}" >&2
+      else
+        printf " * Failed to delete the user: '%s' *\n" "${__DEL_name}" >&2
+        return 1
+      fi
+
+      # remove from admin if admin
+      __DEL_admins="$(grep -m1 "^admin: " "${GROUP_FILE}" | cut -d: -f2- | tr -d '\n')"
+      if printf "%s" "${__DEL_admins}" | grep -qF " ${__DEL_name} "
+      then
+        printf "admin: %s" "$(printf "%s" "${__DEL_admins}" | sed 's/ '"${__DEL_name}"' / /g')" > "${GROUP_FILE}"
+      fi
+
+
+      true
+    }
+
+
+    ### UTILS ###
+
+    print_help() {
+      printf "usage: %s <VERB> [verb-args...]\n\n  <VERB>\n    - ls                   : list all users\n    - add <user-name>      : create a user, or update the password of an existing user\n    - toggle <user-name>   : Toggle a user between admin <-> non-admin\n    - rm <user-name>       : delete a user\n\n" "$(basename "${0}")" >&2
+    }
+
+    init_files() {
+
+      if [ ! -f "${PASSWD_FILE}" ]
+      then
+        touch "${PASSWD_FILE}" || return 1
+      fi
+
+      if [ ! -f "${GROUP_FILE}" ] || ! head -n1 "${GROUP_FILE}" | grep -q "^admin: "
+      then
+        printf "admin: " > "${GROUP_FILE}" || return 1
+      fi
+
+    }
+
+    user_exists() {
+      cut -d: -f1 "${PASSWD_FILE}" | grep -q "^${1:?No username}$"
+    }
+
+    to_lower() {
+      printf "%s" "${1:?No text}" | tr '[:upper:]' '[:lower:]'
+    }
+
+    main "${@}"
+
+
+  manage-tls: |
+    #!/bin/sh
+
+    #
+    # tls management script for https
+    #
+
+    TYPE="$1"
+
+    CERT_FILE="/usr/local/apache2/conf/auth/tls.crt"
+    KEY_FILE="/usr/local/apache2/conf/auth/tls.key"
+
+    unset TARGET_FILE
+    case "$TYPE" in
+      print)
+        if [ -r "$CERT_FILE" ]
+        then
+          printf "\n===========================[ tls.crt ]===========================\n%s\n=================================================================\n\n" \
+            "$(cat "$CERT_FILE")" >&2
+        else
+          printf "(No 'tls.crt' file)\n" >&2
+        fi
+
+        if [ -r "$KEY_FILE" ]
+        then
+          printf "\n===========================[ tls.key ]===========================\n%s\n=================================================================\n\n" \
+            "$(cat "$KEY_FILE")" >&2
+        else
+          printf "(No 'tls.key' file)\n" >&2
+        fi
+
+        exit 0
+        ;;
+
+      cert)
+        TARGET_FILE="$CERT_FILE"
+        ;;
+
+      key)
+        TARGET_FILE="$KEY_FILE"
+        ;;
+
+      *)
+        printf "usage: %s <TYPE>\n\nGet CA cert data from stdin, write it to the corresponding file.\nRemove existing file if no data from stdin (empty).\n\n  <TYPE>\n\n    - print  : print both cert & key files.\n    - cert   : write to CA cert file (tls.crt)\n    - key    : write to CA key file (tls.key)\n\n\n" \
+          "$(basename "${0}")" >&2
+
+        exit 0
+        ;;
+    esac
+
+    printf " * Getting file data for '%s'...\n   [ Ctrl + D ] - Save all input to %s file.\n                  (Remove the existing file if no input)\n   [ Ctrl + C ] - Cancel input.\n\n=========================[ Write Here ]==========================\n" "$TARGET_FILE" "$TYPE" >&2
+
+    TMP_FILE=/tmp/.manage-tls-tmp-input
+    rm -f "$TMP_FILE"
+    cat > "$TMP_FILE"
+    cat "$TMP_FILE" > "$TARGET_FILE"
+    chmod 600 "$TARGET_FILE"
+
+    if [ -s "$TARGET_FILE" ]
+    then
+      printf "\n * New content of '%s':\n=================================================================\n%s\n=================================================================\n\n" "$TARGET_FILE" "$(cat "$TARGET_FILE")" >&2      
+    else
+      rm -f "$TARGET_FILE"
+      printf "\n * Removed a %s file '%s'.\n" "$TYPE" "$TARGET_FILE" >&2
+    fi
+    rm -f "$TMP_FILE"
+
+    printf " * Note: the change is not applied until the container restart!\n\n" >&2
+
+
+
+
+---
+
+
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/name: mreg-conf-auth-httpd
+    hwiwon.kim/mreg: conf-auth-httpd
+  name: mreg-conf-auth-httpd
+  namespace: mreg
+data:
+
+  httpd.conf: |
+    LoadModule headers_module modules/mod_headers.so
+    LoadModule alias_module modules/mod_alias.so
+
+    LoadModule authn_file_module modules/mod_authn_file.so
+    LoadModule authn_core_module modules/mod_authn_core.so
+    LoadModule authz_groupfile_module modules/mod_authz_groupfile.so
+    LoadModule authz_user_module modules/mod_authz_user.so
+    LoadModule authz_core_module modules/mod_authz_core.so
+    LoadModule auth_basic_module modules/mod_auth_basic.so
+    LoadModule access_compat_module modules/mod_access_compat.so
+
+    LoadModule mpm_worker_module modules/mod_mpm_worker.so
+
+    LoadModule log_config_module modules/mod_log_config.so
+
+    LoadModule proxy_module modules/mod_proxy.so
+    LoadModule proxy_http_module modules/mod_proxy_http.so
+
+    LoadModule unixd_module modules/mod_unixd.so
+
+    <IfFile '/usr/local/apache2/conf/auth/tls.crt'>
+      <IfFile '/usr/local/apache2/conf/auth/tls.key'>
+        LoadModule ssl_module modules/mod_ssl.so
+      </IfFile>
+    </IfFile>
+
+
+    PidFile /tmp/httpd.pid
+
+    Header always set "Docker-Distribution-Api-Version" "registry/2.0"
+    Header onsuccess set "Docker-Distribution-Api-Version" "registry/2.0"
+
+
+    <IfModule ssl_module>
+
+      SSLRandomSeed startup builtin
+      SSLRandomSeed connect builtin
+
+      SSLEngine on
+      SSLCertificateFile /usr/local/apache2/conf/auth/tls.crt
+      SSLCertificateKeyFile /usr/local/apache2/conf/auth/tls.key
+
+      ## SSL settings recommendation from: https://raymii.org/s/tutorials/Strong_SSL_Security_On_Apache2.html
+      # Anti CRIME
+      SSLCompression off
+
+      # POODLE and other stuff
+      SSLProtocol all -SSLv2 -SSLv3 -TLSv1
+
+      # Secure cypher suites
+      SSLCipherSuite EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH
+      SSLHonorCipherOrder on
+
+      RequestHeader set X-Forwarded-Proto "https"
+
+    </IfModule>
+
+    <IfModule unixd_module>
+      User daemon
+      Group daemon
+    </IfModule>
+
+
+    TransferLog /dev/stdout
+    ErrorLog /dev/stderr
+
+    LogLevel warn
+
+    <IfModule log_config_module>
+      LogFormat "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" combined
+      LogFormat "%h %l %u %t \"%r\" %>s %b" common
+
+      <IfModule logio_module>
+        LogFormat "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\" %I %O" combinedio
+      </IfModule>
+
+      CustomLog /proc/self/fd/1 common
+    </IfModule>
+
+    ServerRoot "/usr/local/apache2"
+
+    Listen 55000
+
+    <Directory />
+      AllowOverride none
+      Require all denied
+    </Directory>
+
+    <VirtualHost *:55000>
+
+      ProxyRequests     off
+      ProxyPreserveHost on
+
+      # no proxy for /error/ (Apache HTTPd errors messages)
+      ProxyPass /error/ !
+
+
+      # proxy user control
+      <Proxy *>
+        Order deny,allow
+        Allow from all
+        AuthName "Registry Authentication"
+        AuthType basic
+        AuthUserFile "/usr/local/apache2/conf/auth/httpd.htpasswd"
+        AuthGroupFile "/usr/local/apache2/conf/auth/httpd.group"
+
+        # Read access to all users
+        <Limit GET HEAD>
+          Require valid-user
+        </Limit>
+
+        # Write access to admin only
+        <Limit POST PUT DELETE PATCH>
+          Require group admin
+        </Limit>
+
+        # Block rest of the methods
+        <LimitExcept GET HEAD POST PUT DELETE PATCH>
+          Require all denied
+        </LimitExcept>
+
+      </Proxy>
+
+
+      <Location /v2>
+        ProxyPass        http://localhost:5000/v2
+        ProxyPassReverse http://localhost:5000/v2
+      </Location>
+
+    </VirtualHost>

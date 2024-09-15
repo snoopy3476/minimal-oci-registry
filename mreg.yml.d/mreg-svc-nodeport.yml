@@ -1,0 +1,29 @@
+###################################################################
+#                                                                 #
+#             [ Minimal Private OCI Image Registry ]              #
+#                          - Kim Hwiwon <kim.hwiwon@outlook.com>  #
+#                                                                 #
+#        Additional yaml file to make k8s service nodeport        #
+#                                                                 #
+###################################################################
+
+
+
+# service
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/name: mreg-svc
+    hwiwon.kim/mreg: svc
+  name: mreg-svc-nodeport
+  namespace: mreg
+spec:
+  selector:
+    hwiwon.kim/mreg: pod
+  type: NodePort
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: auth
+      nodePort: 30000

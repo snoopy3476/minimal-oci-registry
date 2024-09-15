@@ -1,0 +1,212 @@
+#!/bin/sh
+
+#
+# [client-side script] list & untag image on remote registry
+#
+# usage: mreg-manage <VERB> [args...]
+#
+#   <VERB>
+#     - ls <remote_addr:port>                      : list all img:tag
+#     - rm <remote_addr:port> <img_name:img_tag>   : remove img:tag, and ALL OTHER IMG:TAGS REFERENCING THE SAME IMAGE
+#
+# * Note: This script deletes not only specified tag, but also all img:tags referencing the same manifest!
+#         If you want to delete only the specified tag, push a dummy image to the target image:tag, then delete using this.
+#         Or you might use external utility such as regctl, etc.
+#
+
+
+
+# main function
+# local prefix: M
+main() {
+  _M__VERB="$1"
+  check_prereq
+
+  case "$_M__VERB" in
+    ls) shift; mod_ls "$@" ;;
+    rm) shift; mod_rm "$@" ;;
+    *) print_help ;;
+  esac
+}
+
+
+
+# print help
+print_help() {
+  printf "usage: %s <VERB> [args...]\n\n  <VERB>\n    - ls <remote_addr:port>                      : list all img:tag\n    - rm <remote_addr:port> <img_name:img_tag>   : remove img:tag, and ALL OTHER IMG:TAGS REFERENCING THE SAME IMAGE\n\n" "$(basename "$0")"
+}
+
+
+
+# list remote image:tag
+# local prefix: LI
+mod_ls() {
+
+  # init target data
+  _LI__REMOTE_ADDR="${1:?No remote address is provided}"
+
+  _LI__AUTH_HEADER="$(get_auth "$_LI__REMOTE_ADDR")" || exit 1
+  _LI__REMOTE_ADDR="$(get_host_with_protocol "$_LI__REMOTE_ADDR" "$_LI__AUTH_HEADER")" || exit 1
+
+  _LI__TEMP="$(mktemp -u)"
+  mkfifo "$_LI__TEMP" || exit 1
+
+
+  printf "%s" "$_LI__AUTH_HEADER" \
+    | curl -H @- -k \
+           -s --parallel --parallel-immediate --config "$_LI__TEMP" \
+    | jq -r ".name + \":\" + .tags[]" &
+
+  printf " - Fetching all tags for existing images on '%s'..." "$_LI__REMOTE_ADDR" >&2
+  printf "%s" "$_LI__AUTH_HEADER" \
+    | curl -H @- -k -w '%{stderr} -> %{http_code}\n' \
+           -s "$_LI__REMOTE_ADDR/v2/_catalog" \
+    | jq -r .repositories[] \
+    | xargs -I{} printf "url = \"%s/v2/%s/tags/list\"\n" "$_LI__REMOTE_ADDR" "{}" > "$_LI__TEMP"
+
+  wait
+  _LI__EXIT_CODE="$?"
+  rm -f "$_LI__TEMP"
+
+  return "$_LI__EXIT_CODE"
+}
+
+
+
+# untag remote image:tag (remote reg should support DELETE method!)
+# local prefix: RM
+mod_rm() {
+
+  # init target data
+  _RM__REMOTE_ADDR="${1:?No remote address is provided}"
+  _RM__IMAGE_NAME="${2:?No image name(:tag) is provided}"
+
+  _RM__IMAGE_TAG="${2/*:/}"
+  [ "$_RM__IMAGE_TAG" != "$_RM__IMAGE_NAME" ] || _RM__IMAGE_TAG="latest"
+  _RM__IMAGE_NAME="${2/:*/}"
+
+  _RM__AUTH_HEADER="$(get_auth "$_RM__REMOTE_ADDR")" || exit 1
+  _RM__REMOTE_ADDR="$(get_host_with_protocol "$_RM__REMOTE_ADDR" "$_RM__AUTH_HEADER")" || exit 1
+
+
+  # get digest of the target image tag manifest
+  _RM__TAG_INFO_URL="$_RM__REMOTE_ADDR"/v2/"$_RM__IMAGE_NAME"/manifests/"$_RM__IMAGE_TAG"
+
+  printf " - Parsing '%s'..." "$_RM__TAG_INFO_URL" >&2
+  _RM__IMAGE_DIGEST="$( \
+    printf "%s" "$_RM__AUTH_HEADER" \
+      | curl -k -w '%{stderr} -> %{http_code}\n' \
+             -s -H @- -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+             -I "$_RM__TAG_INFO_URL" \
+      | grep "^Docker-Content-Digest" | cut -d' ' -f2 | tr -d '\n\r' || exit 1 \
+    )" || exit 1
+  [ -n "$_RM__IMAGE_DIGEST" ] || { printf " * Failed to parse image digest!\n" >&2; exit 1; }
+  printf " - Target Digest: '%s'\n" "$_RM__IMAGE_DIGEST"
+
+
+  # untag: remaining data will be garbage-collected on every gc time
+  _RM__DELETE_URL="$_RM__REMOTE_ADDR"/v2/"$_RM__IMAGE_NAME"/manifests/"$_RM__IMAGE_DIGEST"
+  printf " - Deleting '%s'..." "$_RM__DELETE_URL" >&2
+  printf "%s" "$_RM__AUTH_HEADER" \
+    | curl -k -w '%{stderr} -> %{http_code}\n' \
+           -s -H @- -X DELETE "$_RM__DELETE_URL"
+}
+
+
+
+# check pre-requisite commands
+check_prereq() {
+  for cmd in base64 curl jq id xargs mktemp mkfifo stty tr cut grep printf
+  do
+    command -v "$cmd" >/dev/null || { printf " * Command '%s' not found!\n" "$cmd"; exit 1; }
+  done
+}
+
+
+
+# read and print auth info
+# local prefix: AU
+get_auth() {
+
+  _AU__REMOTE_ADDR="${1:?No remote addr}"
+  _AU__REMOTE_ADDR_WITHOUT_PROTOCOL="${_AU__REMOTE_ADDR/http*:\/\//}"
+
+
+  # try parsing user auth data from file (podman + docker)
+  #    (Note: no support for credential stores)
+  unset _AU__AUTH_HEADER
+  for auth_file in "$REGISTRY_AUTH_FILE" "/run/user/$(id -u)/containers/auth.json" "$HOME/.docker/config.json"
+  do
+    #shellcheck disable=SC2236
+    if [ ! -n "$_AU__AUTH_HEADER" ] && [ -r "$auth_file" ]
+    then
+      _AU__AUTH_HEADER="$(<"$auth_file" jq -re '.auths."'"$_AU__REMOTE_ADDR_WITHOUT_PROTOCOL"'".auth | select(.!=null)' )"
+      if [ -n "$_AU__AUTH_HEADER" ]
+      then
+        printf " - Using auth file '%s' to login to '%s'...\n" "$auth_file" "$_AU__REMOTE_ADDR" >&2
+        _AU__AUTH_HEADER="${_AU__AUTH_HEADER:+Authorization: Basic $_AU__AUTH_HEADER}"
+        break
+      fi
+    fi
+  done
+
+
+  # read password for the user, if failed to parse auth info
+  #shellcheck disable=SC2236
+  if [ ! -n "$_AU__AUTH_HEADER" ]
+  then
+    # get registry id
+    unset _AU__ADMIN_ACC_ID
+    until [ -n "$_AU__ADMIN_ACC_ID" ]
+    do
+      printf " + ID for registry '%s': " "$_AU__REMOTE_ADDR" >&2
+      _AU__ADMIN_ACC_ID="$(IFS="
+" read -r val && printf "%s" "$val")"
+    done
+
+    # get registry password
+    unset _AU__ADMIN_ACC_PW
+    trap 'EXIT_CODE="$?"; stty echo; exit "$EXIT_CODE"' INT TERM QUIT HUP
+    stty -echo; printf " + Password: " >&2
+    _AU__ADMIN_ACC_PW="$(IFS="
+" read -r val && printf "%s" "$val")"
+    stty echo; printf "\n" >&2
+
+    # set auth header
+    _AU__AUTH_HEADER="Authorization: Basic $(printf "%s:%s" "$_AU__ADMIN_ACC_ID" "$_AU__ADMIN_ACC_PW" | base64)"
+  fi
+
+  printf "%s" "$_AU__AUTH_HEADER"
+  unset _AU__AUTH_HEADER _AU__ADMIN_ACC_ID _AU__ADMIN_ACC_PW
+}
+
+
+
+# get host address with protocol
+# local prefix: HO
+get_host_with_protocol() {
+
+  _HO__REMOTE_ADDR="${1:?No remote addr}"
+  _HO__AUTH_HEADER="${2:?No auth header}"
+
+  _HO__REMOTE_ADDR_WITHOUT_PROTOCOL="${_HO__REMOTE_ADDR/http*:\/\//}"
+
+  if printf "%s" "$_HO__AUTH_HEADER" \
+    | curl -H @- -k -I "http://$_HO__REMOTE_ADDR_WITHOUT_PROTOCOL/v2/" >/dev/null 2>/dev/null
+  then
+    printf "http://%s" "$_HO__REMOTE_ADDR_WITHOUT_PROTOCOL"
+  elif printf "%s" "$_HO__AUTH_HEADER" \
+    | curl -H @- -k -I "https://$_HO__REMOTE_ADDR_WITHOUT_PROTOCOL/v2/" >/dev/null 2>/dev/null
+  then
+    printf "https://%s" "$_HO__REMOTE_ADDR_WITHOUT_PROTOCOL"
+  else
+    return 1
+  fi
+
+  return 0
+}
+
+
+
+
+main "$@"
